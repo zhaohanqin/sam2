@@ -23,14 +23,14 @@ logger = logging.getLogger(__name__)
 
 # 定义颜色常量 - 使用浅色配色方案
 COLORS = {
-    "background": "#3C67DC",  # 系统UI界面底色
-    "foreground": "#28BCFF",  # 组件颜色
-    "accent1": "#28BCFF",     # 保持组件颜色一致
-    "accent2": "#E0FFDC",     # 按钮颜色
-    "text": "#FFFFFF",        # 白色文字，在深色背景上提高可读性
-    "success": "#E0FFDC",     # 成功颜色使用按钮颜色
-    "warning": "#FF9A8B",     # 警告颜色使用浅色
-    "video_area": "#39E6F4"   # 视频显示区域颜色
+    "background": "#FFFFFF",  # 系统UI界面底色，改为纯白色
+    "foreground": "#F0F8FF",  # 组件颜色，改为爱丽丝蓝（非常浅的蓝色）
+    "accent1": "#E1F5FE",     # 浅蓝色
+    "accent2": "#E8F5E9",     # 浅绿色
+    "text": "#333333",        # 深灰色文字，在浅色背景上提高可读性
+    "success": "#C8E6C9",     # 浅绿色作为成功颜色
+    "warning": "#FFCCBC",     # 浅橙色作为警告颜色
+    "video_area": "#F5F5F5"   # 视频显示区域颜色，改为浅灰色
 }
 
 # 设置全局字体样式

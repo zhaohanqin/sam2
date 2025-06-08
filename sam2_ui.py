@@ -10,6 +10,7 @@ from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QFont
 from PyQt5.QtCore import Qt, QRect, QPoint
 from PIL import Image, ImageDraw
 from sam2.sam2_image_predictor import SAM2ImagePredictor
+import traceback
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -17,27 +18,58 @@ logger = logging.getLogger(__name__)
 
 # 定义颜色常量
 COLORS = {
-    "background": "#C8F5ED",  # 背景色
-    "foreground": "#FDFCC6",  # 前景色
-    "accent1": "#FED0F3",     # 强调色1
-    "accent2": "#D8C2FC"      # 强调色2
+    "background": "#FFFFFF",  # 背景色，改为纯白色
+    "foreground": "#F5F5F5",  # 前景色，改为浅灰色
+    "accent1": "#E1F5FE",     # 强调色1，改为浅蓝色
+    "accent2": "#F3E5F5"      # 强调色2，改为浅紫色
 }
 
 # 设置全局字体样式
 FONT_FAMILY = "微软雅黑"  # 更圆润的字体
 FONT_SIZE = 12  # 更大的字体尺寸
 BUTTON_FONT_SIZE = 16  # 增大按钮字体尺寸
+GROUP_TITLE_FONT_SIZE = 16  # 新增：选项组标题字体大小
+RADIO_BUTTON_FONT_SIZE = 14  # 新增：单选按钮字体大小
 
 # PIL图像转换为QImage的辅助函数
 def pil_to_qimage(pil_image):
-    """将PIL图像转换为QImage"""
-    if pil_image.mode == "RGBA":
-        qim = QImage(pil_image.tobytes("raw", "RGBA"), pil_image.width, pil_image.height, QImage.Format_RGBA8888)
-    else:
-        # 转换为RGB模式
-        rgb_image = pil_image.convert("RGB")
-        qim = QImage(rgb_image.tobytes("raw", "RGB"), rgb_image.width, rgb_image.height, QImage.Format_RGB888)
-    return qim
+    """将PIL图像转换为QImage，使用更安全的方法"""
+    try:
+        # 确保图像是RGB或RGBA模式
+        if pil_image.mode not in ("RGB", "RGBA"):
+            pil_image = pil_image.convert("RGB")
+            
+        # 获取图像尺寸
+        width, height = pil_image.size
+        
+        # 检查图像尺寸是否过大，如果过大则进一步缩小
+        MAX_QT_DIMENSION = 8000  # Qt的图像尺寸限制
+        if width > MAX_QT_DIMENSION or height > MAX_QT_DIMENSION:
+            scale = min(MAX_QT_DIMENSION / width, MAX_QT_DIMENSION / height)
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            logger.warning(f"Image too large for Qt ({width}x{height}), resizing to {new_width}x{new_height}")
+            pil_image = pil_image.resize((new_width, new_height), Image.Resampling.BILINEAR)
+            width, height = pil_image.size
+        
+        if pil_image.mode == "RGBA":
+            # 对于RGBA模式
+            fmt = QImage.Format_RGBA8888
+            bytes_per_line = 4 * width
+            buffer = pil_image.tobytes("raw", "RGBA")
+        else:
+            # 对于RGB模式
+            fmt = QImage.Format_RGB888
+            bytes_per_line = 3 * width
+            buffer = pil_image.tobytes("raw", "RGB")
+        
+        # 创建QImage并复制数据
+        result = QImage(buffer, width, height, bytes_per_line, fmt).copy()
+        return result
+    except Exception as e:
+        logger.error(f"Error in pil_to_qimage: {str(e)}", exc_info=True)
+        # 返回一个小的空白图像，防止程序崩溃
+        return QImage(10, 10, QImage.Format_RGB888)
 
 class ImageCanvas(QLabel):
     """用于显示图像和处理交互的画布"""
@@ -89,43 +121,150 @@ class ImageCanvas(QLabel):
         logger.info("All prompts cleared")
     
     def load_image(self, image_path):
-        """加载图像"""
+        """加载图像，使用更安全的方法"""
         try:
             logger.info(f"Loading image from: {image_path}")
-            self.image = Image.open(image_path).convert("RGB")
-            logger.info(f"Image loaded, size: {self.image.size}")
+            
+            # 先获取图像信息，不完全加载到内存
+            with Image.open(image_path) as img:
+                width, height = img.size
+                logger.info(f"Original image size: {width}x{height}")
+                
+                # 检查图像尺寸是否过大 - 进一步降低最大尺寸限制
+                MAX_DIMENSION = 1024  # 降低最大尺寸到1024
+                MAX_PIXELS = 1000000  # 降低最大像素数到100万像素
+                
+                # 计算图像总像素数
+                total_pixels = width * height
+                logger.info(f"Total pixels: {total_pixels}")
+                
+                # 如果图像尺寸过大，进行缩放
+                if total_pixels > MAX_PIXELS or width > MAX_DIMENSION or height > MAX_DIMENSION:
+                    # 计算缩放比例
+                    scale_factor = min(
+                        1.0,
+                        MAX_DIMENSION / max(width, height),
+                        (MAX_PIXELS / total_pixels) ** 0.5
+                    )
+                    
+                    # 计算新尺寸
+                    new_width = int(width * scale_factor)
+                    new_height = int(height * scale_factor)
+                    
+                    logger.info(f"Scale factor: {scale_factor}, new size: {new_width}x{new_height}")
+                    
+                    # 提示用户图像将被缩放
+                    QMessageBox.information(
+                        self, 
+                        "图像缩放", 
+                        f"图像尺寸过大 ({width}x{height})，将自动缩放至 ({new_width}x{new_height}) 以避免系统崩溃。"
+                    )
+                    
+                    # 处理Qt事件，确保UI响应
+                    QApplication.processEvents()
+                    
+                    try:
+                        # 使用分块处理来减少内存使用
+                        logger.info(f"Resizing image to: {new_width}x{new_height}")
+                        
+                        # 使用NEAREST替代BILINEAR，最小内存占用
+                        self.image = img.resize((new_width, new_height), Image.Resampling.NEAREST)
+                        
+                        # 确保转换为RGB模式
+                        if self.image.mode != "RGB":
+                            self.image = self.image.convert("RGB")
+                            
+                        logger.info(f"Image resized successfully")
+                    except Exception as resize_error:
+                        logger.error(f"Error during image resize: {str(resize_error)}")
+                        # 最后的尝试：创建一个新的空白图像
+                        try:
+                            logger.info("Creating new empty image")
+                            self.image = Image.new("RGB", (new_width, new_height), (255, 255, 255))
+                            logger.info("Empty image created successfully")
+                        except Exception as create_error:
+                            logger.error(f"Create empty image failed: {str(create_error)}")
+                            raise
+                else:
+                    # 图像尺寸合适，直接加载
+                    logger.info("Image size is acceptable, loading directly")
+                    self.image = img.copy().convert("RGB")
+                    logger.info("Image loaded successfully")
+            
+            # 强制进行垃圾回收
+            import gc
+            gc.collect()
+            
+            # 使用QApplication.processEvents()确保UI响应
+            QApplication.processEvents()
+            
+            logger.info("Updating display with loaded image")
             self.update_display()
+            logger.info("Display updated successfully")
+            
+            # 再次强制垃圾回收
+            gc.collect()
+            
             return True
+        except MemoryError as me:
+            logger.error(f"Memory error loading image: {str(me)}", exc_info=True)
+            QMessageBox.critical(self, "内存错误", "图像太大，内存不足。请尝试使用更小的图像。")
+            return False
         except Exception as e:
-            logger.error(f"Error loading image: {str(e)}")
+            logger.error(f"Error loading image: {str(e)}", exc_info=True)
+            # 打印完整的异常堆栈
+            traceback.print_exc()
             QMessageBox.critical(self, "错误", f"无法加载图像: {str(e)}")
             return False
     
     def update_display(self):
-        """更新显示的图像"""
+        """更新显示的图像，使用更安全的方法"""
         if self.image is None:
             logger.warning("Cannot update display, image is None")
             return
         
-        # 创建工作副本
-        self.display_image = self.image.copy()
-        
-        # 绘制点
-        if self.points:
-            for x, y, is_foreground in self.points:
-                color = (0, 255, 0) if is_foreground else (255, 0, 0)  # 绿色为前景，红色为背景
-                self._draw_point(self.display_image, x, y, color)
-        
-        # 绘制框
-        if self.box:
-            self._draw_box(self.display_image, self.box)
-        
-        # 绘制当前正在绘制的框
-        if self.current_box:
-            self._draw_box(self.display_image, self.current_box)
-        
-        # 转换为QPixmap并显示
-        self._update_pixmap()
+        try:
+            # 创建工作副本，但限制大小
+            MAX_DISPLAY_DIMENSION = 1920
+            img_width, img_height = self.image.size
+            
+            # 如果图像太大，先缩小再处理
+            if img_width > MAX_DISPLAY_DIMENSION or img_height > MAX_DISPLAY_DIMENSION:
+                scale = min(MAX_DISPLAY_DIMENSION / img_width, MAX_DISPLAY_DIMENSION / img_height)
+                new_width = int(img_width * scale)
+                new_height = int(img_height * scale)
+                logger.info(f"Scaling display image to {new_width}x{new_height}")
+                
+                # 使用BILINEAR方法缩放，速度和内存占用的平衡
+                display_img = self.image.resize((new_width, new_height), Image.Resampling.BILINEAR)
+                self.display_image = display_img
+            else:
+                # 图像尺寸合适，直接复制
+                self.display_image = self.image.copy()
+            
+            # 绘制点
+            if self.points:
+                for x, y, is_foreground in self.points:
+                    color = (0, 255, 0) if is_foreground else (255, 0, 0)  # 绿色为前景，红色为背景
+                    self._draw_point(self.display_image, x, y, color)
+            
+            # 绘制框
+            if self.box:
+                self._draw_box(self.display_image, self.box)
+            
+            # 绘制当前正在绘制的框
+            if self.current_box:
+                self._draw_box(self.display_image, self.current_box)
+            
+            # 转换为QPixmap并显示
+            self._update_pixmap()
+            
+            # 强制垃圾回收
+            import gc
+            gc.collect()
+        except Exception as e:
+            logger.error(f"Error in update_display: {str(e)}", exc_info=True)
+            QMessageBox.warning(self.parent, "警告", f"更新显示时出错: {str(e)}")
     
     def _draw_point(self, img, x, y, color, radius=8):  # 增大点的半径
         """在图像上绘制点"""
@@ -145,20 +284,53 @@ class ImageCanvas(QLabel):
         draw.rectangle([x0, y0, x1, y1], outline=(255, 255, 0), width=3)  # 增加线宽
     
     def _update_pixmap(self):
-        """更新QPixmap"""
+        """更新QPixmap，使用更安全的方法"""
         if self.display_image is None:
             logger.warning("Cannot update pixmap, display_image is None")
             return
         
         try:
-            # 转换PIL图像为QPixmap
+            # 转换PIL图像为QImage
+            logger.debug("Converting PIL image to QImage")
             qim = pil_to_qimage(self.display_image)
             
+            # 检查QImage是否有效
+            if qim.isNull():
+                logger.error("Generated QImage is null")
+                return
+            
             # 根据控件大小缩放图像
-            self.scaled_image = qim.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.setPixmap(QPixmap.fromImage(self.scaled_image))
+            logger.debug("Scaling image to fit canvas")
+            max_width = min(self.width(), 2000)  # 限制最大宽度
+            max_height = min(self.height(), 2000)  # 限制最大高度
+            
+            # 使用更安全的缩放方法
+            self.scaled_image = qim.scaled(
+                max_width, 
+                max_height, 
+                Qt.KeepAspectRatio, 
+                Qt.FastTransformation  # 使用更快的转换方法
+            )
+            
+            # 创建QPixmap并设置
+            logger.debug("Creating QPixmap from QImage")
+            pixmap = QPixmap.fromImage(self.scaled_image)
+            
+            # 检查pixmap是否有效
+            if pixmap.isNull():
+                logger.error("Generated QPixmap is null")
+                return
+            
+            self.setPixmap(pixmap)
+            logger.debug("Pixmap set successfully")
+            
+            # 处理Qt事件，确保UI响应
+            QApplication.processEvents()
         except Exception as e:
-            logger.error(f"Error updating pixmap: {str(e)}")
+            logger.error(f"Error updating pixmap: {str(e)}", exc_info=True)
+            # 显示错误信息，但不中断程序
+            if self.parent:
+                QMessageBox.warning(self.parent, "警告", f"图像显示出错: {str(e)}")
     
     def get_image_coordinates(self, pos):
         """将控件坐标转换为图像坐标"""
@@ -279,6 +451,7 @@ class ResultCanvas(QLabel):
     """用于显示分割结果的画布"""
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.parent = parent  # 保存父对象引用
         self.setMinimumSize(600, 600)  # 增大最小尺寸
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet(f"background-color: {COLORS['background']}; border-radius: 8px;")
@@ -297,19 +470,51 @@ class ResultCanvas(QLabel):
             self._update_pixmap()
     
     def _update_pixmap(self):
-        """更新QPixmap"""
+        """更新QPixmap，使用更安全的方法"""
         if self.result_image is None:
             return
         
         try:
-            # 转换PIL图像为QPixmap
+            # 转换PIL图像为QImage
+            logger.debug("Converting result image to QImage")
             qim = pil_to_qimage(self.result_image)
             
+            # 检查QImage是否有效
+            if qim.isNull():
+                logger.error("Generated result QImage is null")
+                return
+            
             # 根据控件大小缩放图像
-            self.scaled_image = qim.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.setPixmap(QPixmap.fromImage(self.scaled_image))
+            logger.debug("Scaling result image")
+            max_width = min(self.width(), 2000)  # 限制最大宽度
+            max_height = min(self.height(), 2000)  # 限制最大高度
+            
+            # 使用更安全的缩放方法
+            self.scaled_image = qim.scaled(
+                max_width, 
+                max_height, 
+                Qt.KeepAspectRatio, 
+                Qt.FastTransformation  # 使用更快的转换方法
+            )
+            
+            logger.debug("Creating QPixmap from scaled image")
+            pixmap = QPixmap.fromImage(self.scaled_image)
+            
+            # 检查pixmap是否有效
+            if pixmap.isNull():
+                logger.error("Generated result QPixmap is null")
+                return
+            
+            self.setPixmap(pixmap)
+            logger.debug("Result pixmap set successfully")
+            
+            # 处理Qt事件，确保UI响应
+            QApplication.processEvents()
         except Exception as e:
-            logger.error(f"Error updating result pixmap: {str(e)}")
+            logger.error(f"Error updating result pixmap: {str(e)}", exc_info=True)
+            # 显示错误信息，但不中断程序
+            if self.parent:
+                QMessageBox.warning(self.parent, "警告", f"结果图像显示出错: {str(e)}")
     
     def resizeEvent(self, event):
         """控件大小改变事件"""
@@ -320,10 +525,16 @@ class ResultCanvas(QLabel):
 class SAM2UI(QMainWindow):
     """SAM2交互式分割界面"""
     def __init__(self):
-        super().__init__()
-        self.predictor = None
-        logger.info("Initializing SAM2UI")
-        self.initUI()
+        try:
+            super().__init__()
+            self.predictor = None
+            self.current_mask = None  # 存储当前的掩码
+            logger.info("Initializing SAM2UI")
+            self.initUI()
+        except Exception as e:
+            logger.critical(f"Failed to initialize UI: {str(e)}", exc_info=True)
+            QMessageBox.critical(None, "严重错误", f"初始化界面失败: {str(e)}")
+            sys.exit(1)
     
     def initUI(self):
         """初始化界面"""
@@ -415,6 +626,13 @@ class SAM2UI(QMainWindow):
         segment_btn.setMinimumHeight(50)  # 增加按钮高度
         toolbar_layout.addWidget(segment_btn)
         
+        # 切换视图按钮
+        toggle_view_btn = QPushButton("切换视图")
+        toggle_view_btn.clicked.connect(self.toggle_result_view)
+        toggle_view_btn.setStyleSheet(button_style)
+        toggle_view_btn.setMinimumHeight(50)  # 增加按钮高度
+        toolbar_layout.addWidget(toggle_view_btn)
+        
         # 保存结果按钮
         save_btn = QPushButton("保存结果")
         save_btn.clicked.connect(self.save_result)
@@ -441,29 +659,31 @@ class SAM2UI(QMainWindow):
             QGroupBox {{
                 background-color: {COLORS['accent2']};
                 border-radius: 10px;
-                padding: 5px;
+                padding: 8px;  /* 增加内边距 */
                 font-weight: bold;
-                margin-top: 20px;  /* 进一步减小顶部边距 */
-                max-height: 100px;  /* 降低高度 */
+                margin-top: 25px;  /* 增加顶部边距，为标题腾出空间 */
+                max-height: 120px;  /* 增加高度 */
             }}
             QGroupBox::title {{
                 subcontrol-origin: margin;
-                left: 10px;
-                top: 20px;  /* 降低标题位置 */
-                padding: 0 5px 0 5px;
+                left: 15px;  /* 增加左边距 */
+                top: 15px;  /* 调整标题位置 */
+                padding: 0 8px 0 8px;  /* 增加水平内边距 */
                 background-color: {COLORS['accent2']};
                 color: #333333;
-                font-size: {FONT_SIZE}px;
+                font-size: {GROUP_TITLE_FONT_SIZE}px;  /* 使用新的标题字体大小 */
+                font-weight: bold;  /* 加粗标题 */
             }}
             /* 使单选按钮看起来像按钮 */
             QRadioButton {{
-                font-size: {FONT_SIZE + 2}px;
-                padding: 6px;
-                spacing: 5px;
-                min-height: 30px;
+                font-size: {RADIO_BUTTON_FONT_SIZE}px;  /* 使用新的单选按钮字体大小 */
+                padding: 8px;  /* 增加内边距 */
+                spacing: 8px;  /* 增加间距 */
+                min-height: 36px;  /* 增加最小高度 */
                 background-color: {COLORS['background']};
-                border-radius: 5px;
-                margin: 2px;
+                border-radius: 6px;  /* 增加圆角 */
+                margin: 4px;  /* 增加外边距 */
+                font-weight: bold;  /* 加粗文本 */
             }}
             QRadioButton::indicator {{
                 width: 0px;  /* 隐藏默认指示器 */
@@ -479,14 +699,14 @@ class SAM2UI(QMainWindow):
         
         # 创建水平布局包含两个选项组，让它们占满整个宽度
         compact_options = QHBoxLayout()
-        compact_options.setSpacing(20)  # 增加组之间的间距
+        compact_options.setSpacing(30)  # 增加组之间的间距
         
         # 提示类型选项组 - 更紧凑的设计
         prompt_group = QGroupBox("提示类型")
         prompt_group.setStyleSheet(option_group_style)
         prompt_layout = QHBoxLayout()
-        prompt_layout.setContentsMargins(5, 10, 5, 5)  # 减小内边距
-        prompt_layout.setSpacing(20)  # 减小间距使按钮占据更多空间
+        prompt_layout.setContentsMargins(8, 15, 8, 8)  # 增加内边距，特别是顶部
+        prompt_layout.setSpacing(25)  # 增加间距使按钮占据更多空间
         
         self.point_radio = QRadioButton("点")
         self.point_radio.setChecked(True)
@@ -503,8 +723,8 @@ class SAM2UI(QMainWindow):
         point_type_group = QGroupBox("点类型")
         point_type_group.setStyleSheet(option_group_style)
         point_type_layout = QHBoxLayout()
-        point_type_layout.setContentsMargins(5, 10, 5, 5)  # 减小内边距
-        point_type_layout.setSpacing(20)  # 减小间距使按钮占据更多空间
+        point_type_layout.setContentsMargins(8, 15, 8, 8)  # 增加内边距，特别是顶部
+        point_type_layout.setSpacing(25)  # 增加间距使按钮占据更多空间
         
         self.foreground_radio = QRadioButton("前景")
         self.foreground_radio.setChecked(True)
@@ -521,6 +741,8 @@ class SAM2UI(QMainWindow):
         compact_options.addWidget(prompt_group, 1)  # 设置拉伸因子为1
         compact_options.addWidget(point_type_group, 1)  # 设置拉伸因子为1
         
+        # 增加选项组的垂直空间
+        options_widget.setMinimumHeight(140)  # 设置最小高度
         options_layout.addLayout(compact_options)
         main_layout.addWidget(options_widget)
         
@@ -657,13 +879,28 @@ class SAM2UI(QMainWindow):
             best_iou = iou_scores[best_mask_idx]
             logger.info(f"Segmentation complete, best IoU: {best_iou:.4f}")
             
+            # 保存当前掩码
+            self.current_mask = best_mask
+            
             # 创建结果图像
             result_img = self.visualize_segmentation(self.image_canvas.image, best_mask)
+            
+            # 创建掩码可视化图像
+            mask_img = self.visualize_mask(best_mask, self.image_canvas.image.size)
             
             # 显示结果
             self.result_canvas.set_result(result_img)
             
-            self.statusBar().showMessage(f'分割完成，IoU: {best_iou:.4f}')
+            # 显示一个对话框，询问用户是否要查看掩码
+            reply = QMessageBox.question(self, '查看掩码', 
+                                        '分割完成，是否查看掩码？',
+                                        QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            
+            if reply == QMessageBox.Yes:
+                self.result_canvas.set_result(mask_img)
+                self.statusBar().showMessage(f'显示掩码，IoU: {best_iou:.4f}')
+            else:
+                self.statusBar().showMessage(f'分割完成，IoU: {best_iou:.4f}')
         except Exception as e:
             logger.error(f"Segmentation error: {str(e)}")
             QMessageBox.critical(self, "错误", f"分割失败: {str(e)}")
@@ -715,6 +952,59 @@ class SAM2UI(QMainWindow):
         
         return edge_mask
     
+    def visualize_mask(self, mask, image_size):
+        """可视化掩码"""
+        if mask is None:
+            return None
+            
+        # 创建掩码图像
+        mask_np = mask.astype(np.uint8) * 255
+        mask_pil = Image.fromarray(mask_np).resize(image_size)
+        
+        # 创建彩色掩码
+        colored_mask = Image.new("RGB", image_size, (0, 0, 0))
+        
+        # 为掩码上色 - 使用明亮的颜色
+        mask_color = (240, 100, 200)  # 粉色
+        
+        # 绘制掩码
+        for y in range(mask_pil.height):
+            for x in range(mask_pil.width):
+                if mask_pil.getpixel((x, y)) > 128:
+                    colored_mask.putpixel((x, y), mask_color)
+        
+        # 添加边缘线以增强可见性
+        edge_mask = self._create_edge_mask(mask_np)
+        for y in range(edge_mask.shape[0]):
+            for x in range(edge_mask.shape[1]):
+                if edge_mask[y, x]:
+                    colored_mask.putpixel((x, y), (255, 255, 255))  # 白色边缘
+        
+        return colored_mask
+    
+    def toggle_result_view(self):
+        """在分割结果和掩码之间切换"""
+        if self.current_mask is None or self.image_canvas.image is None:
+            return
+            
+        # 检查当前显示的是否是掩码
+        is_showing_mask = False
+        if self.result_canvas.result_image:
+            # 简单检查：掩码图像的左上角像素通常是黑色的
+            left_top_pixel = self.result_canvas.result_image.getpixel((0, 0))
+            is_showing_mask = left_top_pixel == (0, 0, 0)
+        
+        if is_showing_mask:
+            # 如果当前显示的是掩码，则切换到分割结果
+            result_img = self.visualize_segmentation(self.image_canvas.image, self.current_mask)
+            self.result_canvas.set_result(result_img)
+            self.statusBar().showMessage('显示分割结果')
+        else:
+            # 如果当前显示的是分割结果，则切换到掩码
+            mask_img = self.visualize_mask(self.current_mask, self.image_canvas.image.size)
+            self.result_canvas.set_result(mask_img)
+            self.statusBar().showMessage('显示掩码')
+    
     def save_result(self):
         """保存分割结果"""
         if self.result_canvas.result_image is None:
@@ -741,10 +1031,23 @@ if __name__ == "__main__":
     try:
         logger.info("Starting SAM2 UI application")
         app = QApplication(sys.argv)
+        
+        # 设置应用级别的异常处理
+        def exception_hook(exctype, value, traceback_obj):
+            """全局异常钩子，捕获未处理的异常"""
+            logger.critical("Uncaught exception", exc_info=(exctype, value, traceback_obj))
+            msg = f"发生未捕获的异常:\n{exctype.__name__}: {value}"
+            QMessageBox.critical(None, "错误", msg)
+        
+        # 替换默认的异常处理器
+        sys.excepthook = exception_hook
+        
         ui = SAM2UI()
         ui.show()
         logger.info("Application window shown")
         sys.exit(app.exec_())
     except Exception as e:
         logger.critical(f"Application crashed: {str(e)}", exc_info=True)
-        print(f"Critical error: {str(e)}") 
+        print(f"Critical error: {str(e)}")
+        QMessageBox.critical(None, "严重错误", f"应用程序崩溃: {str(e)}")
+        sys.exit(1) 
