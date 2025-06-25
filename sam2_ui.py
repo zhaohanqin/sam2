@@ -85,11 +85,9 @@ def get_model_dir():
     """获取模型存储目录，使用当前程序所在目录下的models文件夹"""
     # 获取程序所在目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    # 项目根目录
-    project_root = os.path.dirname(script_dir)
     
-    # 在项目根目录下创建models文件夹
-    model_dir = os.path.join(project_root, "models")
+    # 在sam2目录下创建models文件夹
+    model_dir = os.path.join(script_dir, "models")
     
     # 如果目录不存在，创建它
     os.makedirs(model_dir, exist_ok=True)

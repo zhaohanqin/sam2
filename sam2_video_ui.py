@@ -74,11 +74,9 @@ def get_model_dir():
     """获取模型存储目录，使用当前程序所在目录下的models文件夹"""
     # 获取程序所在目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    # 项目根目录
-    project_root = os.path.dirname(script_dir)
     
-    # 在项目根目录下创建models文件夹
-    model_dir = os.path.join(project_root, "models")
+    # 在sam2目录下创建models文件夹
+    model_dir = os.path.join(script_dir, "models")
     
     # 如果目录不存在，创建它
     os.makedirs(model_dir, exist_ok=True)
@@ -1381,22 +1379,61 @@ class SAM2VideoUI(QMainWindow):
                 os.environ["TORCH_COMPILE_DISABLE_TRITON"] = "1"
                 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32"
                 
-                # 导入模型类
-                from sam2.sam2_video_predictor import SAM2VideoPredictor
-                
                 # 设置设备
                 device = "cpu" if use_cpu else "cuda"
                 
-                # 从Hugging Face加载或本地文件加载
+                # 从本地文件加载
                 if valid_local_file:
-                    self.predictor = SAM2VideoPredictor.from_checkpoint(
-                        model_path, 
-                        vos_optimized=False,  # 禁用torch.compile避免错误
+                    # 修复本地模型加载 - 需要同时提供配置文件和模型权重
+                    logger.info(f"Loading from local file: {model_path}")
+                    
+                    # 根据模型文件名确定对应的配置文件
+                    config_name = None
+                    for size_key, info in MODEL_INFO.items():
+                        if model_path.endswith(info['file_name']):
+                            if "2.1" in info['file_name']:  # SAM 2.1 模型
+                                config_name = f"configs/sam2.1/sam2.1_hiera_{size_key[0]}.yaml"
+                                if size_key == "base":
+                                    config_name = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+                                break
+                            else:  # SAM 2.0 模型
+                                config_name = f"configs/sam2/sam2_hiera_{size_key[0]}.yaml"
+                                if size_key == "base":
+                                    config_name = "configs/sam2/sam2_hiera_b+.yaml"
+                                break
+                    
+                    if not config_name:
+                        # 如果无法匹配配置，根据文件名推断
+                        if "tiny" in model_path:
+                            config_name = "configs/sam2.1/sam2.1_hiera_t.yaml"
+                        elif "small" in model_path:
+                            config_name = "configs/sam2.1/sam2.1_hiera_s.yaml"
+                        elif "base_plus" in model_path or "base+" in model_path:
+                            config_name = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+                        elif "large" in model_path:
+                            config_name = "configs/sam2.1/sam2.1_hiera_l.yaml"
+                        else:
+                            # 默认使用tiny配置
+                            config_name = "configs/sam2.1/sam2.1_hiera_t.yaml"
+                    
+                    logger.info(f"Using config: {config_name} for model: {model_path}")
+                    
+                    # 导入构建函数
+                    from sam2.build_sam import build_sam2_video_predictor
+                    
+                    # 使用build_sam2_video_predictor直接从本地文件加载
+                    self.predictor = build_sam2_video_predictor(
+                        config_file=config_name,
+                        ckpt_path=model_path,
+                        vos_optimized=False,
                         device=device
                     )
                 else:
-                    self.predictor = SAM2VideoPredictor.from_pretrained(
-                        model_info['repo'], 
+                    # 如果本地文件不存在，使用预训练模型ID
+                    logger.info(f"Loading from Hugging Face model: {model_info['repo']}")
+                    from sam2.build_sam import build_sam2_video_predictor_hf
+                    self.predictor = build_sam2_video_predictor_hf(
+                        model_id=model_info['repo'], 
                         vos_optimized=False,
                         device=device
                     )
@@ -1434,8 +1471,12 @@ class SAM2VideoUI(QMainWindow):
                                     return
                             
                             self.statusBar().showMessage('正在使用CPU模式加载tiny模型...')
-                            self.predictor = SAM2VideoPredictor.from_checkpoint(
-                                tiny_model_path, 
+                            
+                            # 使用正确的本地模型加载方法
+                            from sam2.build_sam import build_sam2_video_predictor
+                            self.predictor = build_sam2_video_predictor(
+                                config_file="configs/sam2.1/sam2.1_hiera_t.yaml",
+                                ckpt_path=tiny_model_path,
                                 vos_optimized=False,
                                 device="cpu"
                             )
@@ -1445,8 +1486,10 @@ class SAM2VideoUI(QMainWindow):
                             
                         except Exception as cpu_error:
                             error_messages.append(f"CPU模式加载失败: {str(cpu_error)}")
+                        else:
+                            error_messages.append("用户取消了CPU模式加载")
                     else:
-                        error_messages.append("用户取消了CPU模式加载")
+                        error_messages.append(f"运行时错误: {str(e)}")
                 else:
                     error_messages.append(f"运行时错误: {str(e)}")
             except Exception as e:

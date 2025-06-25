@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 # 使用 from_pretrained 自动下载并加载模型
 predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2.1-hiera-tiny")
-your_image = Image.open("1.jpeg")  
+your_image = Image.open(r"E:\SAM2\sam2\1.jpeg")  
 img_width, img_height = your_image.size
 
 # 添加点提示 - 格式: [[x1, y1], [x2, y2], ...]
