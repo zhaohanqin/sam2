@@ -142,8 +142,8 @@ class ImageCanvas(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent = parent
-        self.setMinimumSize(700, 500)  # 增加最小尺寸
-        self.setMaximumHeight(700)     # 增加最大高度限制
+        self.setMinimumSize(600, 400)  # 减小最小高度
+        self.setMaximumHeight(450)     # 添加最大高度限制
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet(f"background-color: {COLORS['background']}; border-radius: 8px;")
         
@@ -519,8 +519,8 @@ class ResultCanvas(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent = parent  # 保存父对象引用
-        self.setMinimumSize(700, 500)  # 增加最小尺寸
-        self.setMaximumHeight(700)     # 增加最大高度限制
+        self.setMinimumSize(600, 400)  # 减小最小高度
+        self.setMaximumHeight(450)     # 添加最大高度限制
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet(f"background-color: {COLORS['background']}; border-radius: 8px;")
         self.result_image = None
@@ -608,7 +608,7 @@ class SAM2UI(QMainWindow):
     def initUI(self):
         """初始化界面"""
         self.setWindowTitle('SAM2 图像智能分割')
-        self.setGeometry(100, 100, 1700, 1050)  # 进一步增加窗口尺寸
+        self.setGeometry(100, 100, 1600, 950)  # 增加窗口尺寸
         self.setStyleSheet(f"""
             QMainWindow {{
                 background-color: {COLORS['background']};
@@ -1186,32 +1186,30 @@ class SAM2UI(QMainWindow):
         """)
         
         canvas_layout = QVBoxLayout(canvas_container)
-        canvas_layout.setContentsMargins(10, 5, 10, 25)  # 增加底部边距
-        canvas_layout.setSpacing(60)  # 增加组件与画布底部的距离
+        canvas_layout.setContentsMargins(2, 1, 20, 20)  # 减小顶部边距
+        canvas_layout.setSpacing(1)  # 减小间距
         
-        # 创建画布标题 - 增大字体确保清晰显示
+        # 创建画布标题 - 居中显示但减小边距
         canvas_title = QLabel("图像编辑区域")
         canvas_title.setAlignment(Qt.AlignCenter)  # 居中对齐
         canvas_title.setStyleSheet(f"""
-            font-size: 24px;  /* 增大字体 */
+            font-size: 40px;  /* 保持大字体 */
             font-weight: bold;
             color: {COLORS['primary']};
-            padding-bottom: 4px;  /* 增加内边距 */
-            padding-top: 4px;  /* 增加内边距 */
-            margin-bottom: 5px;  /* 增加外边距 */
-            border-bottom: 2px solid {COLORS['primary']};  /* 加粗边框 */
+            padding-bottom: 40px;  /* 减小底部边距 */
+            padding-top: 2px;  /* 减小顶部边距 */
+            border-bottom: 1px solid {COLORS['divider']};
             text-align: center;
         """)
-        canvas_title.setMaximumHeight(40)  # 设置最高高度
         canvas_layout.addWidget(canvas_title)
         
         # 创建分割器，允许调整两个画布的大小
         splitter = QSplitter(Qt.Horizontal)
-        splitter.setHandleWidth(6)  # 减小分割条宽度
+        splitter.setHandleWidth(8)  # 增加分割条宽度
         splitter.setStyleSheet(f"""
             QSplitter::handle {{
                 background-color: {COLORS['divider']};
-                border-radius: 3px;
+                border-radius: 4px;
             }}
             QSplitter::handle:hover {{
                 background-color: {COLORS['primary_light']};
@@ -1226,23 +1224,19 @@ class SAM2UI(QMainWindow):
             border: 1px solid {COLORS['divider']};
         """)
         original_layout = QVBoxLayout(original_container)
-        original_layout.setContentsMargins(2, 2, 20, 20)  # 进一步减小内边距
-        original_layout.setSpacing(1)  # 进一步减小间距
+        original_layout.setContentsMargins(10, 10, 10, 10)
         
-        # 原始图像标签 - 增大字体使其更清晰
+        # 原始图像标签
         original_label = QLabel("原始图像")
         original_label.setStyleSheet(f"""
-            font-size: 20px;
-            font-weight: bold;
+            font-size: 14px;
+            font-weight: 500;
             color: {COLORS['text_primary']};
-            padding: 5px;  /* 增加内边距 */
-            margin: 5px;  /* 增加外边距 */
+            padding: 5px;
             background-color: {COLORS['card_bg']};
-            border-radius: 5px;
-            border: 1px solid {COLORS['primary']};  /* 添加边框 */
+            border-radius: 4px;
         """)
         original_label.setAlignment(Qt.AlignCenter)
-        original_label.setMaximumHeight(35)  # 设置最大高度
         original_layout.addWidget(original_label)
         
         # 原始图像画布
@@ -1261,23 +1255,19 @@ class SAM2UI(QMainWindow):
             border: 1px solid {COLORS['divider']};
         """)
         result_layout = QVBoxLayout(result_container)
-        result_layout.setContentsMargins(20, 20, 2, 20)  # 进一步减小内边距
-        result_layout.setSpacing(1)  # 进一步减小间距
+        result_layout.setContentsMargins(10, 10, 10, 10)
         
-        # 结果图像标签 - 保持大字体并优化样式
+        # 结果图像标签
         result_label = QLabel("分割结果")
         result_label.setStyleSheet(f"""
-            font-size: 20px;
-            font-weight: bold;
+            font-size: 14px;
+            font-weight: 500;
             color: {COLORS['text_primary']};
-            padding: 5px;  /* 增加内边距 */
-            margin: 5px;  /* 增加外边距 */
+            padding: 5px;
             background-color: {COLORS['card_bg']};
-            border-radius: 5px;
-            border: 1px solid {COLORS['primary']};  /* 添加边框 */
+            border-radius: 4px;
         """)
         result_label.setAlignment(Qt.AlignCenter)
-        result_label.setMaximumHeight(35)  # 设置最小高度
         result_layout.addWidget(result_label)
         
         # 结果图像画布
@@ -1292,8 +1282,8 @@ class SAM2UI(QMainWindow):
         splitter.addWidget(original_container)
         splitter.addWidget(result_container)
         
-        # 设置初始分割位置 - 增加大小
-        splitter.setSizes([800, 800])
+        # 设置初始分割位置
+        splitter.setSizes([700, 700])
         
         # 添加分割器到画布布局
         canvas_layout.addWidget(splitter)

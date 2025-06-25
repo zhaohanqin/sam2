@@ -4,6 +4,9 @@ import numpy as np
 import torch
 import logging
 import cv2
+import requests
+import time
+import urllib3
 
 # 禁用PyTorch编译和Triton相关功能，避免错误
 os.environ["TORCH_COMPILE_DISABLE_CUDA_GRAPHS"] = "1"
@@ -12,7 +15,8 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32"
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QFileDialog, QRadioButton, QButtonGroup,
-                             QSlider, QGroupBox, QMessageBox, QSplitter, QProgressBar)
+                             QSlider, QGroupBox, QMessageBox, QSplitter, QProgressBar, QProgressDialog,
+                             QDialog, QDialogButtonBox, QCheckBox)
 from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QFont
 from PyQt5.QtCore import Qt, QRect, QPoint, QTimer
 from PIL import Image, ImageDraw
@@ -32,6 +36,55 @@ COLORS = {
     "warning": "#FFCCBC",     # 浅橙色作为警告颜色
     "video_area": "#F5F5F5"   # 视频显示区域颜色，改为浅灰色
 }
+
+# 定义模型信息 - 添加在颜色常量后面
+MODEL_INFO = {
+    "tiny": {
+        "name": "sam2.1-hiera-tiny",
+        "repo": "facebook/sam2.1-hiera-tiny",
+        "file_name": "sam2.1_hiera_tiny.pt",
+        "download_url": "https://huggingface.co/facebook/sam2.1-hiera-tiny/resolve/main/sam2.1_hiera_tiny.pt",
+        "description": "最小 (适合低配置设备)"
+    },
+    "small": {
+        "name": "sam2.1-hiera-small",
+        "repo": "facebook/sam2.1-hiera-small",
+        "file_name": "sam2.1_hiera_small.pt",
+        "download_url": "https://huggingface.co/facebook/sam2.1-hiera-small/resolve/main/sam2.1_hiera_small.pt",
+        "description": "小型 (适合中等配置)"
+    },
+    "base": {
+        "name": "sam2.1-hiera-base",
+        "repo": "facebook/sam2.1-hiera-base",
+        "file_name": "sam2.1_hiera_base.pt",
+        "download_url": "https://huggingface.co/facebook/sam2.1-hiera-base/resolve/main/sam2.1_hiera_base.pt",
+        "description": "中型 (推荐配置)"
+    },
+    "large": {
+        "name": "sam2.1-hiera-large",
+        "repo": "facebook/sam2.1-hiera-large",
+        "file_name": "sam2.1_hiera_large.pt",
+        "download_url": "https://huggingface.co/facebook/sam2.1-hiera-large/resolve/main/sam2.1_hiera_large.pt",
+        "description": "大型 (高端配置)"
+    }
+}
+
+# 获取模型存储路径
+def get_model_dir():
+    """获取模型存储目录，使用当前程序所在目录下的models文件夹"""
+    # 获取程序所在目录
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # 项目根目录
+    project_root = os.path.dirname(script_dir)
+    
+    # 在项目根目录下创建models文件夹
+    model_dir = os.path.join(project_root, "models")
+    
+    # 如果目录不存在，创建它
+    os.makedirs(model_dir, exist_ok=True)
+    
+    logger.info(f"Using models directory: {model_dir}")
+    return model_dir
 
 # 设置全局字体样式
 FONT_FAMILY = "微软雅黑"  # 符合要求的字体
@@ -120,6 +173,240 @@ def apply_mask_to_image(image, mask, color=(0, 255, 0), alpha=0.5):
     # 将掩码叠加到图像上
     return cv2.addWeighted(image, 1, color_mask, alpha, 0)
 
+def download_model(model_info, save_path, parent_widget=None):
+    """下载模型文件，带进度条和重试机制"""
+    # 创建进度对话框
+    from PyQt5.QtWidgets import QProgressDialog, QMessageBox
+    from PyQt5.QtCore import Qt
+    
+    progress = QProgressDialog("正在下载模型...", "取消", 0, 100, parent_widget)
+    progress.setWindowTitle("下载模型")
+    progress.setWindowModality(Qt.WindowModal)
+    progress.setMinimumDuration(0)
+    progress.setValue(0)
+    progress.setStyleSheet(f"""
+        QProgressDialog {{
+            background-color: {COLORS['foreground']};
+            border-radius: 10px;
+            min-width: 400px;
+        }}
+        QLabel {{
+            color: {COLORS['text']};
+            font-size: 14px;
+            margin-bottom: 10px;
+        }}
+        QPushButton {{
+            background-color: {COLORS['accent2']};
+            color: {COLORS['text']};
+            border: none;
+            border-radius: 4px;
+            padding: 8px 16px;
+            font-weight: 500;
+        }}
+    """)
+    progress.show()
+    
+    # 使用更可靠的下载方法
+    max_retries = 5  # 增加重试次数
+    retry_count = 0
+    auto_retry_count = 0
+    max_auto_retries = 2  # 自动重试次数
+    timeout_seconds = 60  # 增加超时时间
+    chunk_size = 8192  # 下载块大小
+    
+    # 尝试多个下载URL，包括官方和备用镜像
+    download_urls = [
+        model_info['download_url'],
+        f"https://hf-mirror.com/{model_info['repo']}/resolve/main/{model_info['file_name']}",  # 镜像1
+        f"https://huggingface.co/{model_info['repo']}/resolve/main/{model_info['file_name']}?download=true"  # 强制下载
+    ]
+    
+    # 创建临时文件，用于断点续传
+    temp_file = f"{save_path}.part"
+    
+    while retry_count < max_retries:
+        try:
+            # 获取已下载的大小，用于断点续传
+            existing_size = 0
+            if os.path.exists(temp_file):
+                existing_size = os.path.getsize(temp_file)
+                logger.info(f"Resuming download from {existing_size} bytes")
+                progress.setLabelText(f"正在继续下载模型...(已下载 {existing_size/1024/1024:.1f}MB)")
+            
+            # 创建会话，进行下载
+            session = requests.Session()
+            
+            # 禁用SSL警告
+            urllib3.disable_warnings()
+            
+            # 选择下载URL，每次重试使用不同的URL
+            url_index = min(retry_count, len(download_urls) - 1)
+            download_url = download_urls[url_index]
+            logger.info(f"Trying download URL {url_index + 1}/{len(download_urls)}: {download_url}")
+            progress.setLabelText(f"正在尝试下载源 {url_index + 1}: {os.path.basename(download_url)}")
+            QApplication.processEvents()
+            
+            # 设置请求头，用于断点续传
+            headers = {}
+            if existing_size > 0:
+                headers['Range'] = f'bytes={existing_size}-'
+            
+            # 设置较长的超时时间
+            response = session.get(
+                download_url, 
+                stream=True, 
+                timeout=timeout_seconds,
+                verify=True,  # 保持SSL验证启用
+                headers=headers
+            )
+            response.raise_for_status()
+            
+            # 检查是否支持断点续传
+            if existing_size > 0 and response.status_code != 206:
+                logger.warning("Server doesn't support resume, starting from beginning")
+                existing_size = 0
+            
+            # 获取文件大小
+            if 'content-length' in response.headers:
+                content_length = int(response.headers['content-length'])
+                total_size = existing_size + content_length
+            else:
+                # 如果无法获取大小，使用一个估计值
+                content_length = 0
+                total_size = 500000000  # 假设500MB
+            
+            logger.info(f"Download started, total size: {total_size/1024/1024:.1f}MB")
+            
+            # 打开文件用于写入
+            mode = 'ab' if existing_size > 0 else 'wb'
+            with open(temp_file, mode) as f:
+                downloaded = existing_size
+                start_time = time.time()
+                last_update_time = start_time
+                
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if progress.wasCanceled():
+                        f.close()
+                        logger.info("Download cancelled by user")
+                        if parent_widget:
+                            parent_widget.statusBar().showMessage('取消下载')
+                        return False
+                    
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        # 更新进度
+                        now = time.time()
+                        if now - last_update_time > 0.1:  # 每0.1秒更新一次UI
+                            percent = int(downloaded / total_size * 100) if total_size > 0 else 0
+                            speed = downloaded / (now - start_time) / 1024  # KB/s
+                            
+                            if speed > 1024:
+                                speed_text = f"{speed/1024:.1f} MB/s"
+                            else:
+                                speed_text = f"{speed:.1f} KB/s"
+                            
+                            progress.setLabelText(f"正在下载模型... {downloaded/1024/1024:.1f}/{total_size/1024/1024:.1f} MB ({speed_text})")
+                            progress.setValue(min(percent, 100))
+                            QApplication.processEvents()
+                            last_update_time = now
+            
+            # 下载完成，重命名临时文件
+            if os.path.exists(save_path):
+                os.remove(save_path)
+            os.rename(temp_file, save_path)
+            
+            progress.setValue(100)
+            logger.info(f"Model downloaded successfully to: {save_path}")
+            return True
+            
+        except (requests.RequestException, IOError) as e:
+            error_msg = str(e)
+            logger.error(f"Download attempt {retry_count + 1} failed: {error_msg}")
+            
+            # 自动重试几次，不打扰用户
+            if auto_retry_count < max_auto_retries:
+                auto_retry_count += 1
+                logger.info(f"Auto-retrying ({auto_retry_count}/{max_auto_retries})...")
+                progress.setLabelText(f"下载出错，正在自动重试 ({auto_retry_count}/{max_auto_retries})...")
+                progress.setValue(0)
+                QApplication.processEvents()
+                time.sleep(2)  # 等待2秒后重试
+                continue
+            
+            # 超过自动重试次数，询问用户
+            retry_count += 1
+            if retry_count < max_retries:
+                retry_msg = (
+                    f"下载失败 (尝试 {retry_count}/{max_retries}):\n"
+                    f"{error_msg}\n\n"
+                    "是否更换下载源重试？"
+                )
+                retry = QMessageBox.question(
+                    parent_widget, "下载错误", retry_msg, 
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if retry == QMessageBox.Yes:
+                    auto_retry_count = 0  # 重置自动重试计数
+                    progress.setValue(0)
+                    continue
+                else:
+                    break
+            else:
+                # 达到最大重试次数
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                
+                QMessageBox.critical(
+                    parent_widget, 
+                    "下载失败", 
+                    f"多次尝试后仍无法下载模型:\n{error_msg}\n\n"
+                    "可能的解决方法:\n"
+                    "1. 检查网络连接\n"
+                    "2. 尝试使用VPN\n"
+                    "3. 手动下载模型:\n"
+                    f"   - 网址: {model_info['download_url']}\n"
+                    f"   - 保存至: {save_path}\n\n"
+                    "是否尝试使用备用下载方法？"
+                )
+                
+                # 提供备用下载选项
+                backup_options = QMessageBox(parent_widget)
+                backup_options.setWindowTitle("备用下载选项")
+                backup_options.setText("请选择备用下载方式:")
+                backup_options.setIcon(QMessageBox.Question)
+                
+                browser_btn = backup_options.addButton("使用浏览器下载", QMessageBox.ActionRole)
+                skip_btn = backup_options.addButton("跳过下载", QMessageBox.ActionRole)
+                cancel_btn = backup_options.addButton("取消", QMessageBox.RejectRole)
+                
+                backup_options.exec_()
+                
+                clicked_button = backup_options.clickedButton()
+                if clicked_button == browser_btn:
+                    # 打开浏览器下载页面
+                    import webbrowser
+                    download_page = f"https://huggingface.co/{model_info['repo']}/blob/main/{model_info['file_name']}"
+                    webbrowser.open(download_page)
+                    QMessageBox.information(
+                        parent_widget,
+                        "手动下载指南",
+                        f"1. 在打开的网页中，点击'下载'按钮\n"
+                        f"2. 将下载的文件移动到以下位置:\n{save_path}\n"
+                        f"3. 然后重新启动应用程序"
+                    )
+                    return False
+                elif clicked_button == skip_btn:
+                    return False
+                else:
+                    return False
+    
+    if os.path.exists(temp_file):
+        os.remove(temp_file)
+    progress.close()
+    return False
+
 class VideoCanvas(QLabel):
     """用于显示视频帧和处理交互的画布"""
     def __init__(self, parent=None):
@@ -131,7 +418,6 @@ class VideoCanvas(QLabel):
             background-color: {COLORS['video_area']};
             border-radius: 12px;
             border: 2px solid #FFFFFF;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
         """)
         
         # 视频和帧相关
@@ -147,6 +433,7 @@ class VideoCanvas(QLabel):
         # 交互状态
         self.drawing = False
         self.point_mode = True  # True: 点模式, False: 框模式
+        self.semantic_mode = False  # 新增：语义分割模式
         self.foreground_point = True  # True: 前景点, False: 背景点
         
         # 点和框数据
@@ -157,6 +444,11 @@ class VideoCanvas(QLabel):
         
         # 结果
         self.segmentation_results = {}  # 存储分割结果: {frame_idx: masks}
+        
+        # 缩放
+        self.zoom_factor = 1.0
+        self.max_zoom = 5.0
+        self.min_zoom = 0.5
         
         # 设置鼠标追踪
         self.setMouseTracking(True)
@@ -306,6 +598,18 @@ class VideoCanvas(QLabel):
         try:
             # 转换OpenCV图像为QImage
             qim = cv2_to_qimage(self.display_frame)
+            
+            # 应用缩放
+            if self.zoom_factor != 1.0:
+                orig_width = qim.width()
+                orig_height = qim.height()
+                
+                # 计算缩放后的尺寸
+                new_width = int(orig_width * self.zoom_factor)
+                new_height = int(orig_height * self.zoom_factor)
+                
+                # 缩放图像
+                qim = qim.scaled(new_width, new_height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             
             # 根据控件大小缩放图像
             self.scaled_frame = qim.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -479,6 +783,35 @@ class VideoCanvas(QLabel):
         """清除所有分割结果"""
         self.segmentation_results = {}
         self.update_display()
+    
+    def set_semantic_mode(self, is_semantic_mode):
+        """设置是否为语义分割模式"""
+        self.semantic_mode = is_semantic_mode
+        logger.info(f"Semantic mode set to: {is_semantic_mode}")
+        # 语义分割模式下清除所有提示
+        if is_semantic_mode:
+            self.clear_prompts()
+    
+    def wheelEvent(self, event):
+        """鼠标滚轮事件处理，实现缩放功能"""
+        if self.current_frame is None:
+            return
+        
+        # 获取滚轮滚动的角度
+        delta = event.angleDelta().y()
+        
+        # 根据滚轮方向调整缩放因子
+        if delta > 0:
+            # 向上滚，放大
+            self.zoom_factor = min(self.max_zoom, self.zoom_factor * 1.1)
+        else:
+            # 向下滚，缩小
+            self.zoom_factor = max(self.min_zoom, self.zoom_factor / 1.1)
+        
+        # 更新显示
+        self.update_display()
+        
+        logger.info(f"Zoom factor changed to: {self.zoom_factor}")
 
 class SAM2VideoUI(QMainWindow):
     """SAM2视频分割界面"""
@@ -488,6 +821,9 @@ class SAM2VideoUI(QMainWindow):
         self.inference_state = None
         self.is_tracking = False
         self.current_obj_id = 1  # 当前对象ID
+        
+        # 语义分割阈值
+        self.semantic_threshold = 0.5  # 默认阈值
         
         # 播放控制
         self.play_timer = QTimer()
@@ -511,7 +847,6 @@ class SAM2VideoUI(QMainWindow):
                 border: 2px solid #FFFFFF;
                 margin-top: 12px;
                 padding-top: 12px;
-                box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
             }}
             QLabel {{
                 color: {COLORS['text']};
@@ -545,17 +880,16 @@ class SAM2VideoUI(QMainWindow):
                 font-weight: bold;
             }}
             QPushButton:hover {{
-                background-color: #FFFFFF;
-                color: {COLORS['background']};
+                background-color: #D0EFD0;
+                border: 2px solid #FFFFFF;
             }}
             QPushButton:pressed {{
-                background-color: #D0EFD0;
-                border-color: #D0EFD0;
+                background-color: #B0E0B0;
+                border: 2px solid #FFFFFF;
             }}
             QPushButton:disabled {{
                 background-color: #A0D0E0;
                 color: #666666;
-                border-color: #A0D0E0;
             }}
         """
         
@@ -565,7 +899,7 @@ class SAM2VideoUI(QMainWindow):
             QWidget {{
                 background-color: {COLORS['foreground']};
                 border-radius: 10px;
-                box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+                border: 2px solid #FFFFFF;
             }}
         """)
         toolbar_layout = QHBoxLayout(toolbar_widget)
@@ -599,10 +933,25 @@ class SAM2VideoUI(QMainWindow):
         # 追踪按钮 - 使用强调色
         track_btn = QPushButton("开始追踪")
         track_btn.clicked.connect(self.track_objects)
-        track_btn.setStyleSheet(self.button_style + f"""
-            background-color: #FFFFFF;
-            color: {COLORS['background']};
-            font-weight: bold;
+        track_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #FFE0B0;
+                color: #333333;
+                border: 2px solid #FFFFFF;
+                border-radius: 10px;
+                padding: 12px 20px;
+                font-family: {FONT_FAMILY};
+                font-size: {BUTTON_FONT_SIZE}px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: #FFD090;
+                border: 2px solid #FFFFFF;
+            }}
+            QPushButton:pressed {{
+                background-color: #FFBB70;
+                border: 2px solid #FFFFFF;
+            }}
         """)
         toolbar_layout.addWidget(track_btn)
         
@@ -651,12 +1000,18 @@ class SAM2VideoUI(QMainWindow):
                 background-color: {COLORS['background']};
                 border-radius: 8px;
                 margin: 5px;
-                color: #FFFFFF;
+                color: {COLORS['text']};
+                font-weight: normal;
             }}
             QRadioButton:checked {{
                 font-weight: bold;
                 color: #333333;
                 background-color: {COLORS['accent2']};
+                border: 2px solid #FFFFFF;
+            }}
+            QRadioButton:hover {{
+                background-color: #D0EFD0;
+                border: 1px solid #FFFFFF;
             }}
         """
         
@@ -666,18 +1021,38 @@ class SAM2VideoUI(QMainWindow):
         
         prompt_group = QGroupBox("提示类型")
         prompt_group.setStyleSheet(option_group_style)
-        prompt_layout = QHBoxLayout()
+        prompt_layout = QVBoxLayout()  # 改为垂直布局
         prompt_layout.setContentsMargins(10, 15, 10, 5)
         prompt_layout.setSpacing(10)
         
-        self.point_radio = QRadioButton("点")
+        # 第一行：点和框选项
+        prompt_row1 = QHBoxLayout()
+        prompt_row1.setSpacing(10)
+        
+        self.point_radio = QRadioButton("点标注")
         self.point_radio.setChecked(True)
         self.point_radio.toggled.connect(self.toggle_prompt_type)
         
-        self.box_radio = QRadioButton("框")
+        self.box_radio = QRadioButton("框标注")
+        self.box_radio.toggled.connect(self.toggle_prompt_type)
         
-        prompt_layout.addWidget(self.point_radio, 1)
-        prompt_layout.addWidget(self.box_radio, 1)
+        prompt_row1.addWidget(self.point_radio, 1)
+        prompt_row1.addWidget(self.box_radio, 1)
+        
+        # 第二行：语义分割选项
+        prompt_row2 = QHBoxLayout()
+        prompt_row2.setSpacing(10)
+        
+        self.semantic_radio = QRadioButton("语义分割")
+        self.semantic_radio.toggled.connect(self.toggle_prompt_type)
+        
+        prompt_row2.addWidget(self.semantic_radio, 1)
+        prompt_row2.addStretch(1)
+        
+        # 添加两行到提示类型布局
+        prompt_layout.addLayout(prompt_row1)
+        prompt_layout.addLayout(prompt_row2)
+        
         prompt_group.setLayout(prompt_layout)
         
         # 点类型选项组
@@ -722,10 +1097,62 @@ class SAM2VideoUI(QMainWindow):
         
         obj_id_group.setLayout(obj_id_layout)
         
+        # 语义分割选项组 (默认隐藏)
+        self.semantic_options_group = QGroupBox("语义分割选项")
+        self.semantic_options_group.setStyleSheet(option_group_style)
+        self.semantic_options_group.setVisible(False)  # 默认隐藏
+        semantic_options_layout = QVBoxLayout()
+        semantic_options_layout.setContentsMargins(10, 15, 10, 5)
+        semantic_options_layout.setSpacing(10)
+        
+        # 语义分割说明
+        semantic_desc = QLabel("自动对整个视频帧进行语义分割，识别所有物体")
+        semantic_desc.setStyleSheet(f"""
+            color: {COLORS['text']};
+            font-size: 12px;
+            padding: 5px;
+            background-color: {COLORS['background']};
+            border-radius: 4px;
+            line-height: 1.4;
+        """)
+        semantic_desc.setWordWrap(True)
+        semantic_options_layout.addWidget(semantic_desc)
+        
+        # 分割阈值
+        threshold_container = QWidget()
+        threshold_layout = QHBoxLayout(threshold_container)
+        threshold_layout.setContentsMargins(0, 0, 0, 0)
+        threshold_layout.setSpacing(10)
+        
+        threshold_label = QLabel("分割阈值:")
+        threshold_layout.addWidget(threshold_label)
+        
+        self.threshold_slider = QSlider(Qt.Horizontal)
+        self.threshold_slider.setMinimum(0)
+        self.threshold_slider.setMaximum(100)
+        self.threshold_slider.setValue(50)  # 默认值50%
+        self.threshold_slider.setTickPosition(QSlider.TicksBelow)
+        self.threshold_slider.setTickInterval(10)
+        self.threshold_slider.valueChanged.connect(self.update_threshold_value)
+        threshold_layout.addWidget(self.threshold_slider)
+        
+        self.threshold_value_label = QLabel("50%")
+        self.threshold_value_label.setStyleSheet(f"""
+            color: {COLORS['accent2']};
+            font-weight: bold;
+            min-width: 40px;
+            text-align: right;
+        """)
+        threshold_layout.addWidget(self.threshold_value_label)
+        
+        semantic_options_layout.addWidget(threshold_container)
+        self.semantic_options_group.setLayout(semantic_options_layout)
+        
         # 将选项组添加到布局
         compact_options.addWidget(prompt_group, 1)
         compact_options.addWidget(point_type_group, 1)
         compact_options.addWidget(obj_id_group, 1)
+        compact_options.addWidget(self.semantic_options_group, 1)
         
         options_layout.addLayout(compact_options)
         main_layout.addWidget(options_widget)
@@ -737,23 +1164,28 @@ class SAM2VideoUI(QMainWindow):
                 background-color: {COLORS['foreground']};
                 border-radius: 10px;
                 border: 2px solid #FFFFFF;
-                box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
             }}
             QSlider::groove:horizontal {{
-                height: 10px;
+                height: 8px;
                 background: {COLORS['background']};
-                border-radius: 5px;
+                border-radius: 4px;
+                margin: 2px 0;
             }}
             QSlider::handle:horizontal {{
-                background: {COLORS['accent2']};
-                width: 20px;
-                height: 20px;
+                background: #FFD090;
+                width: 18px;
+                height: 18px;
                 margin: -5px 0;
-                border-radius: 10px;
+                border-radius: 9px;
+                border: 2px solid #FFFFFF;
             }}
             QSlider::sub-page:horizontal {{
                 background: {COLORS['accent2']};
-                border-radius: 5px;
+                border-radius: 4px;
+            }}
+            QLabel {{
+                color: {COLORS['text']};
+                font-weight: bold;
             }}
         """)
         playback_layout = QHBoxLayout(playback_widget)
@@ -823,11 +1255,13 @@ class SAM2VideoUI(QMainWindow):
                 height: 25px;
                 font-family: {FONT_FAMILY};
                 font-size: {FONT_SIZE}px;
-                color: #FFFFFF;
+                color: {COLORS['text']};
+                margin: 5px;
+                padding: 0px;
             }}
             QProgressBar::chunk {{
-                background-color: {COLORS['accent2']};
-                width: 15px;
+                background-color: #B0E0B0;
+                width: 10px;
                 margin: 0px;
                 border-radius: 5px;
             }}
@@ -878,16 +1312,15 @@ class SAM2VideoUI(QMainWindow):
     def load_model(self):
         """加载SAM2模型"""
         try:
-            # 显示模型选择对话框
+            # 选择模型大小
             model_size = self.select_model_size()
             if not model_size:
                 self.statusBar().showMessage('模型加载取消')
                 return
-                
-            self.statusBar().showMessage('正在加载模型...')
+            
+            # 显示进度条
             self.progress_bar.setVisible(True)
             self.progress_bar.setValue(10)
-            QApplication.processEvents()  # 更新UI
             
             # 检查是否选择了CPU模式
             use_cpu = False
@@ -899,435 +1332,142 @@ class SAM2VideoUI(QMainWindow):
             else:
                 logger.info(f"Loading SAM2 model: {model_size}")
             
-            # 根据选择的大小确定模型ID
-            model_id = f"facebook/sam2.1-hiera-{model_size}"
+            # 获取模型信息
+            model_info = MODEL_INFO[model_size]
             
-            # 显示正在下载/加载的提示
-            self.statusBar().showMessage(f'正在下载/加载模型: {model_id}...')
-            self.progress_bar.setValue(30)
+            # 检查本地模型文件
+            model_dir = get_model_dir()
+            model_path = os.path.join(model_dir, model_info["file_name"])
+            
+            # 检查本地文件是否存在且有效（非0字节）
+            valid_local_file = os.path.exists(model_path) and os.path.getsize(model_path) > 0
+            
+            if not valid_local_file:
+                reply = QMessageBox.question(
+                    self, 
+                    "下载模型", 
+                    f"未找到本地模型文件，需要下载模型 ({model_info['name']})。\n"
+                    f"这可能需要几分钟时间，是否继续？\n"
+                    f"（文件将保存至: {model_dir}）",
+                    QMessageBox.Yes | QMessageBox.No, 
+                    QMessageBox.Yes
+                )
+                
+                if reply == QMessageBox.Yes:
+                    self.statusBar().showMessage(f'正在下载模型: {model_info["name"]}...')
+                    # 下载模型
+                    if not download_model(model_info, model_path, self):
+                        self.progress_bar.setVisible(False)
+                        return
+                else:
+                    self.statusBar().showMessage('取消模型加载')
+                    self.progress_bar.setVisible(False)
+                    return
+            
+            # 加载模型
+            self.statusBar().showMessage('正在加载模型...')
+            self.progress_bar.setValue(50)
             QApplication.processEvents()  # 更新UI
             
-            # 尝试加载模型
+            logger.info(f"Loading SAM2 model from: {model_path}")
+            
+            # 尝试使用不同的加载方法
+            load_success = False
+            error_messages = []
+            
             try:
-                self.load_sam2_model(model_id, use_cpu)
+                # 设置一些环境变量，避免可能的错误
+                os.environ["TORCH_COMPILE_DISABLE_CUDA_GRAPHS"] = "1"
+                os.environ["TORCH_COMPILE_DISABLE_TRITON"] = "1"
+                os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32"
                 
-                self.progress_bar.setValue(100)
-                device_type = "CPU" if use_cpu else "GPU"
-                self.statusBar().showMessage(f'模型 {model_size} 在{device_type}上加载成功')
-                self.progress_bar.setVisible(False)
+                # 导入模型类
+                from sam2.sam2_video_predictor import SAM2VideoPredictor
                 
-                # 显示成功消息
-                QMessageBox.information(self, "成功", f"SAM2 模型 ({model_size}) 已成功在{device_type}上加载！\n现在可以加载视频并开始分割。")
+                # 设置设备
+                device = "cpu" if use_cpu else "cuda"
+                
+                # 从Hugging Face加载或本地文件加载
+                if valid_local_file:
+                    self.predictor = SAM2VideoPredictor.from_checkpoint(
+                        model_path, 
+                        vos_optimized=False,  # 禁用torch.compile避免错误
+                        device=device
+                    )
+                else:
+                    self.predictor = SAM2VideoPredictor.from_pretrained(
+                        model_info['repo'], 
+                        vos_optimized=False,
+                        device=device
+                    )
+                
+                load_success = True
                 
             except RuntimeError as e:
                 # 处理CUDA内存不足错误
                 if "CUDA out of memory" in str(e) or "device-side assert" in str(e):
-                    self.handle_cuda_memory_error(model_size)
-                else:
-                    # 其他RuntimeError
-                    raise e
-            except Exception as e:
-                if "404" in str(e):
-                    logger.error(f"Model not found on Hugging Face: {str(e)}")
-                    QMessageBox.critical(self, "错误", f"在Hugging Face上找不到模型 {model_id}，请检查网络连接或选择其他模型")
-                else:
-                    logger.error(f"Error downloading model: {str(e)}")
-                    QMessageBox.critical(self, "错误", f"下载模型时出错: {str(e)}")
-                self.statusBar().showMessage('模型加载失败')
-                self.progress_bar.setVisible(False)
-        except Exception as e:
-            logger.error(f"Error loading model: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "错误", f"无法加载模型: {str(e)}")
-            self.statusBar().showMessage('模型加载失败')
-            self.progress_bar.setVisible(False)
-    
-    def load_sam2_model(self, model_id, use_cpu=False):
-        """加载SAM2模型的实际函数，包含错误处理"""
-        try:
-            from sam2.sam2_video_predictor import SAM2VideoPredictor
-            
-            # 设置进度更新
-            self.statusBar().showMessage(f'正在下载模型文件...')
-            self.progress_bar.setValue(40)
-            QApplication.processEvents()
-            
-            # 加载模型
-            device = "cpu" if use_cpu else "cuda"
-            
-            # 设置一些环境变量，避免可能的错误
-            os.environ["TORCH_COMPILE_DISABLE_CUDA_GRAPHS"] = "1"
-            os.environ["TORCH_COMPILE_DISABLE_TRITON"] = "1"
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32"
-            
-            # 尝试加载模型，禁用torch.compile避免错误
-            self.predictor = SAM2VideoPredictor.from_pretrained(
-                model_id, 
-                vos_optimized=False,  # 禁用torch.compile
-                device=device
-            )
-            
-            self.progress_bar.setValue(90)
-            self.statusBar().showMessage(f'模型加载完成，正在初始化...')
-            QApplication.processEvents()
-            
-            return True
-            
-        except ImportError as e:
-            logger.error(f"SAM2 module not found: {str(e)}")
-            QMessageBox.critical(self, "错误", "无法导入SAM2模块，请确保正确安装了SAM2")
-            self.statusBar().showMessage('模型加载失败: 模块未找到')
-            self.progress_bar.setVisible(False)
-            raise
-    
-    def handle_cuda_memory_error(self, current_model_size):
-        """处理CUDA内存不足错误的专用函数"""
-        logger.error(f"CUDA out of memory when loading {current_model_size} model")
-        
-        # 提供选项
-        retry = QMessageBox.question(
-            self, 
-            "GPU内存不足", 
-            f"您的GPU内存不足以加载{current_model_size}模型。\n\n是否尝试使用CPU模式加载tiny模型？\n(注意：CPU模式会非常慢)",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        
-        if retry == QMessageBox.Yes:
-            # 清理之前的尝试
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            # 设置为使用CPU
-            self.statusBar().showMessage('正在使用CPU模式重试...')
-            QApplication.processEvents()
-            
-            # 使用CPU模式加载tiny模型
-            try:
-                model_id = "facebook/sam2.1-hiera-tiny"
-                self.load_sam2_model(model_id, use_cpu=True)
-                
-                self.progress_bar.setValue(100)
-                logger.info("SAM2 model loaded successfully on CPU")
-                self.statusBar().showMessage(f'模型已在CPU上加载成功')
-                self.progress_bar.setVisible(False)
-                
-                # 显示成功消息
-                QMessageBox.information(self, "成功", f"SAM2 tiny模型已在CPU上成功加载！\n注意：CPU模式下处理速度会较慢。")
-                
-            except Exception as cpu_error:
-                logger.error(f"Failed to load model on CPU: {str(cpu_error)}")
-                QMessageBox.critical(self, "错误", f"在CPU上加载模型失败: {str(cpu_error)}")
-                self.statusBar().showMessage('模型加载失败')
-                self.progress_bar.setVisible(False)
-                raise cpu_error
-        else:
-            self.statusBar().showMessage('模型加载取消')
-            self.progress_bar.setVisible(False)
-    
-    def select_model_size(self):
-        """选择模型大小"""
-        sizes = {
-            "tiny": "最小 (适合低配置设备)",
-            "small": "小型 (适合中等配置)",
-            "base_plus": "中型+ (推荐配置)",
-            "large": "大型 (高端配置)"
-        }
-        
-        # 创建选择对话框
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle("选择模型大小")
-        dialog.setText("请选择要加载的SAM2模型大小：\n(根据您的设备性能选择合适的大小)")
-        dialog.setIcon(QMessageBox.Question)
-        
-        # 添加按钮
-        buttons = {}
-        for size, description in sizes.items():
-            button = dialog.addButton(f"{size} - {description}", QMessageBox.ActionRole)
-            buttons[button] = size
-        
-        # 添加CPU模式选项
-        cpu_button = dialog.addButton("CPU模式 (使用tiny模型)", QMessageBox.ActionRole)
-        buttons[cpu_button] = "tiny_cpu"
-        
-        cancel_button = dialog.addButton("取消", QMessageBox.RejectRole)
-        
-        # 显示对话框并获取结果
-        dialog.exec_()
-        
-        clicked_button = dialog.clickedButton()
-        if clicked_button == cancel_button:
-            return None
-        
-        return buttons[clicked_button]
-    
-    def toggle_prompt_type(self):
-        """切换提示类型"""
-        is_point_mode = self.point_radio.isChecked()
-        self.video_canvas.set_point_mode(is_point_mode)
-    
-    def toggle_point_type(self):
-        """切换点类型"""
-        is_foreground = self.foreground_radio.isChecked()
-        self.video_canvas.set_foreground_point(is_foreground)
-    
-    def clear_prompts(self):
-        """清除所有提示"""
-        self.video_canvas.clear_prompts()
-        self.statusBar().showMessage('已清除所有提示')
-    
-    def increase_obj_id(self):
-        """增加对象ID"""
-        self.current_obj_id += 1
-        self.update_obj_id_label()
-    
-    def decrease_obj_id(self):
-        """减少对象ID"""
-        if self.current_obj_id > 1:
-            self.current_obj_id -= 1
-            self.update_obj_id_label()
-    
-    def update_obj_id_label(self):
-        """更新对象ID标签"""
-        self.obj_id_label.setText(f"当前对象: {self.current_obj_id}")
-    
-    def add_segmentation(self):
-        """为当前帧添加分割"""
-        if self.predictor is None:
-            logger.warning("Segmentation attempted without loading model")
-            QMessageBox.warning(self, "警告", "请先加载模型")
-            return
-        
-        if self.video_canvas.current_frame is None:
-            logger.warning("Segmentation attempted without loading video")
-            QMessageBox.warning(self, "警告", "请先加载视频")
-            return
-        
-        # 获取提示数据
-        point_coords, point_labels, box = self.video_canvas.get_prompt_data()
-        
-        if point_coords is None and box is None:
-            logger.warning("Segmentation attempted without prompts")
-            QMessageBox.warning(self, "警告", "请添加至少一个点或一个框")
-            return
-        
-        try:
-            # 首次分割需要初始化
-            if self.inference_state is None:
-                logger.info("Initializing inference state...")
-                self.statusBar().showMessage('初始化分割状态...')
-                
-                try:
-                    with torch.inference_mode():
-                        # 检查是否在CPU上运行
-                        if self.predictor.device.type == "cpu":
-                            self.statusBar().showMessage('在CPU上初始化中，可能需要较长时间...')
-                            QApplication.processEvents()
-                            
-                        self.inference_state = self.predictor.init_state(self.video_canvas.video_path)
-                        
-                except RuntimeError as e:
-                    if "CUDA out of memory" in str(e):
-                        logger.error(f"CUDA out of memory during initialization: {str(e)}")
-                        QMessageBox.critical(self, "错误", "GPU内存不足，无法初始化视频状态。请尝试使用CPU模式或更小的模型。")
-                        self.statusBar().showMessage('初始化失败：GPU内存不足')
-                        return
-                    else:
-                        raise e
-                    
-                logger.info("Inference state initialized")
-            
-            # 添加新的点或框
-            self.statusBar().showMessage('正在分割...')
-            logger.info(f"Adding segmentation for object {self.current_obj_id} on frame {self.video_canvas.frame_index}")
-            
-            try:
-                with torch.inference_mode():
-                    # 如果在CPU上运行，提示用户可能需要等待较长时间
-                    if self.predictor.device.type == "cpu":
-                        self.statusBar().showMessage('在CPU上处理中，请耐心等待...')
-                        QApplication.processEvents()
-                    
-                    # 使用自动类型转换，避免CUDA/CPU类型不匹配错误
-                    if point_coords is not None:
-                        point_coords = point_coords.astype(np.float32)
-                        logger.info(f"Point coords shape: {point_coords.shape}")
-                    if point_labels is not None:
-                        logger.info(f"Point labels shape: {point_labels.shape}")
-                    if box is not None:
-                        box = box.astype(np.float32)
-                        logger.info(f"Box shape: {box.shape}, values: {box}")
-                    
-                    # 打印当前视频分辨率以进行调试
-                    video_h, video_w = self.video_canvas.current_frame.shape[:2]
-                    logger.info(f"Video frame size: {video_w}x{video_h}")
-                    
-                    # 捕获特定错误并提供详细信息
-                    try:
-                        frame_idx, obj_ids, masks = self.predictor.add_new_points_or_box(
-                            self.inference_state,
-                            frame_idx=self.video_canvas.frame_index,
-                            obj_id=self.current_obj_id,
-                            points=point_coords,
-                            labels=point_labels,
-                            box=box,
-                            normalize_coords=True
-                        )
-                        
-                        # 打印掩码信息
-                        if isinstance(masks, torch.Tensor):
-                            logger.info(f"Mask tensor shape: {masks.shape}, device: {masks.device}")
-                            masks = masks.cpu().numpy()
-                        logger.info(f"Masks numpy shape: {masks.shape}")
-                        
-                    except ValueError as ve:
-                        logger.error(f"ValueError in add_new_points_or_box: {str(ve)}")
-                        if "boolean index did not match" in str(ve):
-                            # 创建一个空掩码作为替代
-                            logger.info("Creating empty mask as fallback due to shape mismatch")
-                            masks = np.zeros((1, video_h, video_w), dtype=bool)
-                            frame_idx = self.video_canvas.frame_index
-                            obj_ids = [self.current_obj_id]
-                        else:
-                            raise
-                    
-            except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    logger.error(f"CUDA out of memory during segmentation: {str(e)}")
-                    QMessageBox.critical(self, "错误", "GPU内存不足，无法完成分割。请尝试使用CPU模式或更小的模型。")
-                    self.statusBar().showMessage('分割失败：GPU内存不足')
-                    return
-                else:
-                    raise e
-            
-            # 将结果添加到视频画布
-            logger.info(f"Adding segmentation result for frame {frame_idx}, mask shape: {masks.shape}")
-            self.video_canvas.add_segmentation_result(frame_idx, masks)
-            
-            self.statusBar().showMessage(f'已添加分割，对象ID: {self.current_obj_id}')
-            logger.info(f"Segmentation added for object {self.current_obj_id}")
-        except Exception as e:
-            logger.error(f"Segmentation error: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "错误", f"分割失败: {str(e)}")
-            self.statusBar().showMessage('分割失败')
-    
-    def track_objects(self):
-        """追踪视频中的对象"""
-        if self.predictor is None:
-            logger.warning("Tracking attempted without loading model")
-            QMessageBox.warning(self, "警告", "请先加载模型")
-            return
-        
-        if self.inference_state is None:
-            logger.warning("Tracking attempted without segmentation")
-            QMessageBox.warning(self, "警告", "请先添加至少一个分割")
-            return
-        
-        if self.is_tracking:
-            logger.warning("Tracking already in progress")
-            QMessageBox.information(self, "提示", "追踪已在进行中")
-            return
-        
-        try:
-            self.is_tracking = True
-            self.statusBar().showMessage('正在追踪对象...')
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(0)
-            
-            # 暂停播放
-            self.stop_playback()
-            
-            # 追踪对象
-            logger.info("Starting object tracking")
-            
-            # 检查是否在CPU上运行
-            is_cpu_mode = self.predictor.device.type == "cpu"
-            if is_cpu_mode:
-                # 在CPU模式下提示用户可能需要很长时间
-                warning = QMessageBox.warning(
-                    self, 
-                    "CPU模式警告", 
-                    "您正在使用CPU模式，追踪过程可能非常慢。\n\n是否继续？",
-                    QMessageBox.Yes | QMessageBox.No
-                )
-                
-                if warning == QMessageBox.No:
-                    self.is_tracking = False
-                    self.statusBar().showMessage('追踪已取消')
-                    self.progress_bar.setVisible(False)
-                    return
-                
-                self.statusBar().showMessage('在CPU上追踪中，请耐心等待...')
-            
-            # 使用Torch的推理模式
-            try:
-                with torch.inference_mode():
-                    # 追踪生成器
-                    tracking_generator = self.predictor.propagate_in_video(
-                        self.inference_state,
-                        start_frame_idx=self.video_canvas.frame_index
+                    # 尝试在CPU上重新加载tiny模型
+                    retry = QMessageBox.question(
+                        self, 
+                        "GPU内存不足", 
+                        f"您的GPU内存不足以加载{model_size}模型。\n\n是否尝试使用CPU模式加载tiny模型？\n(注意：CPU模式会非常慢)",
+                        QMessageBox.Yes | QMessageBox.No
                     )
                     
-                    # 获取总帧数以更新进度条
-                    total_frames = self.video_canvas.total_frames
-                    
-                    # 处理每一帧
-                    for frame_idx, obj_ids, masks in tracking_generator:
-                        # 更新进度条
-                        progress = int((frame_idx / total_frames) * 100)
-                        self.progress_bar.setValue(progress)
-                        QApplication.processEvents()  # 更新UI
+                    if retry == QMessageBox.Yes:
+                        # 清理之前的尝试
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                         
-                        # 确保掩码在CPU上，以便可以转换为NumPy数组
+                        # 使用CPU模式加载tiny模型
                         try:
-                            # 打印掩码信息以进行调试
-                            if isinstance(masks, torch.Tensor):
-                                logger.info(f"Tracking frame {frame_idx}, mask tensor shape: {masks.shape}, device: {masks.device}")
-                                # 安全地将掩码转换到CPU
-                                if masks.device.type != "cpu":
-                                    masks = masks.detach().cpu()
-                                masks = masks.numpy()
+                            tiny_model_info = MODEL_INFO["tiny"]
+                            tiny_model_path = os.path.join(model_dir, tiny_model_info["file_name"])
                             
-                            logger.info(f"Mask numpy shape: {masks.shape}")
+                            # 检查是否需要下载tiny模型
+                            if not os.path.exists(tiny_model_path) or os.path.getsize(tiny_model_path) == 0:
+                                self.statusBar().showMessage(f'正在下载tiny模型...')
+                                if not download_model(tiny_model_info, tiny_model_path, self):
+                                    self.progress_bar.setVisible(False)
+                                    return
                             
-                            # 添加分割结果
-                            self.video_canvas.add_segmentation_result(frame_idx, masks)
+                            self.statusBar().showMessage('正在使用CPU模式加载tiny模型...')
+                            self.predictor = SAM2VideoPredictor.from_checkpoint(
+                                tiny_model_path, 
+                                vos_optimized=False,
+                                device="cpu"
+                            )
                             
-                            # 日志
-                            logger.info(f"Tracked frame {frame_idx}, objects: {obj_ids}")
-                        except Exception as mask_err:
-                            logger.error(f"Error processing masks for frame {frame_idx}: {str(mask_err)}")
-                            # 创建一个空掩码作为替代
-                            video_h, video_w = self.video_canvas.current_frame.shape[:2]
-                            empty_masks = np.zeros((len(obj_ids), video_h, video_w), dtype=bool)
-                            self.video_canvas.add_segmentation_result(frame_idx, empty_masks)
-                        
-            except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    logger.error(f"CUDA out of memory during tracking: {str(e)}")
-                    QMessageBox.critical(self, "错误", "GPU内存不足，无法完成追踪。请尝试使用CPU模式或更小的模型。")
-                    self.statusBar().showMessage('追踪失败：GPU内存不足')
-                    self.progress_bar.setVisible(False)
-                    self.is_tracking = False
-                    return
+                            load_success = True
+                            model_size = "tiny"  # 更新模型大小
+                            
+                        except Exception as cpu_error:
+                            error_messages.append(f"CPU模式加载失败: {str(cpu_error)}")
+                    else:
+                        error_messages.append("用户取消了CPU模式加载")
                 else:
-                    raise e
+                    error_messages.append(f"运行时错误: {str(e)}")
+            except Exception as e:
+                error_messages.append(f"加载错误: {str(e)}")
             
-            self.progress_bar.setValue(100)
-            self.is_tracking = False
-            self.statusBar().showMessage('追踪完成')
-            logger.info("Object tracking completed")
+            # 根据加载结果显示消息
+            if load_success:
+                self.statusBar().showMessage(f'模型 {model_size} 加载成功')
+                self.progress_bar.setValue(100)
+                QMessageBox.information(self, "成功", f"SAM2 模型 ({model_size}) 已成功加载！")
+            else:
+                error_details = "\n".join(error_messages)
+                QMessageBox.critical(self, "错误", f"无法加载模型，请尝试重新下载。\n\n错误详情:\n{error_details}")
+                self.statusBar().showMessage('模型加载失败')
             
-            # 提示用户追踪完成
-            QMessageBox.information(self, "提示", "对象追踪完成，可以使用播放按钮查看结果")
-            
-            # 隐藏进度条
             self.progress_bar.setVisible(False)
+            
         except Exception as e:
-            self.is_tracking = False
-            logger.error(f"Tracking error: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "错误", f"追踪失败: {str(e)}")
-            self.statusBar().showMessage('追踪失败')
+            logger.error(f"Error in load_model: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "错误", f"加载模型过程中出错: {str(e)}")
+            self.statusBar().showMessage('模型加载失败')
             self.progress_bar.setVisible(False)
     
     def save_result(self):
@@ -1455,6 +1595,246 @@ class SAM2VideoUI(QMainWindow):
         # 如果正在播放，重新启动计时器以应用新的间隔
         if self.play_timer.isActive():
             self.play_timer.start(self.play_speed)
+    
+    def clear_prompts(self):
+        """清除所有提示"""
+        # 调用画布的清除方法
+        if hasattr(self, 'video_canvas') and self.video_canvas is not None:
+            self.video_canvas.clear_prompts()
+            self.statusBar().showMessage('已清除所有提示')
+        else:
+            logger.warning("Cannot clear prompts, video_canvas not initialized")
+    
+    def toggle_prompt_type(self):
+        """切换提示类型"""
+        if self.point_radio.isChecked():
+            self.video_canvas.set_point_mode(True)
+            self.semantic_options_group.setVisible(False)
+        elif self.box_radio.isChecked():
+            self.video_canvas.set_point_mode(False)
+            self.semantic_options_group.setVisible(False)
+        elif self.semantic_radio.isChecked():
+            # 激活语义分割模式
+            self.video_canvas.set_semantic_mode(True)
+            self.semantic_options_group.setVisible(True)
+        
+        logger.info(f"Prompt type toggled: point={self.point_radio.isChecked()}, box={self.box_radio.isChecked()}, semantic={self.semantic_radio.isChecked()}")
+    
+    def toggle_point_type(self):
+        """切换点类型"""
+        self.video_canvas.set_foreground_point(self.foreground_radio.isChecked())
+    
+    def update_threshold_value(self):
+        """更新阈值显示"""
+        value = self.threshold_slider.value()
+        self.threshold_value_label.setText(f"{value}%")
+        self.semantic_threshold = value / 100.0
+        logger.info(f"Semantic threshold updated to {self.semantic_threshold}")
+    
+    def increase_obj_id(self):
+        """增加对象ID"""
+        self.current_obj_id += 1
+        self.update_obj_id_label()
+    
+    def decrease_obj_id(self):
+        """减少对象ID"""
+        if self.current_obj_id > 1:
+            self.current_obj_id -= 1
+            self.update_obj_id_label()
+    
+    def update_obj_id_label(self):
+        """更新对象ID标签"""
+        self.obj_id_label.setText(f"当前对象: {self.current_obj_id}")
+    
+    def select_model_size(self):
+        """选择模型大小"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("选择模型大小")
+        dialog.resize(400, 300)
+        
+        layout = QVBoxLayout()
+        
+        # 添加说明标签
+        label = QLabel("请根据您的硬件配置选择合适的模型大小:")
+        label.setStyleSheet("font-weight: bold; margin-bottom: 10px;")
+        layout.addWidget(label)
+        
+        # 添加模型选项
+        model_buttons = {}
+        for size, info in MODEL_INFO.items():
+            text = f"{info['name']} - {info['description']}"
+            radio = QRadioButton(text)
+            if size == "base":  # 默认选中base模型
+                radio.setChecked(True)
+            layout.addWidget(radio)
+            model_buttons[size] = radio
+        
+        # 添加CPU选项
+        cpu_checkbox = QCheckBox("使用CPU模式 (适用于无GPU或GPU内存不足的情况)")
+        layout.addWidget(cpu_checkbox)
+        
+        layout.addSpacing(20)
+        
+        # 添加警告标签
+        warning = QLabel("注意: 较大的模型需要更多内存和计算资源。如果您的电脑配置不足，可能会导致程序崩溃。")
+        warning.setStyleSheet("color: red; font-style: italic;")
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+        
+        # 添加按钮盒子
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        dialog.setLayout(layout)
+        
+        # 显示对话框
+        result = dialog.exec_()
+        if result == QDialog.Accepted:
+            for size, button in model_buttons.items():
+                if button.isChecked():
+                    selected = size
+                    break
+            else:
+                selected = "base"  # 默认base
+            
+            # 添加CPU后缀
+            if cpu_checkbox.isChecked():
+                selected += "_cpu"
+                
+            return selected
+        else:
+            return None
+
+    def add_segmentation(self):
+        """添加分割"""
+        if self.predictor is None:
+            QMessageBox.warning(self, "警告", "请先加载模型")
+            return
+        
+        if self.video_canvas.current_frame is None:
+            QMessageBox.warning(self, "警告", "请先加载视频")
+            return
+        
+        try:
+            self.statusBar().showMessage('正在进行分割...')
+            
+            # 获取当前帧
+            current_frame = self.video_canvas.current_frame
+            frame_pil = cv2_to_pil(current_frame)
+            
+            # 获取提示数据
+            point_coords, point_labels, box = self.video_canvas.get_prompt_data()
+            
+            # 判断分割模式
+            if self.semantic_radio.isChecked():
+                # 语义分割模式 - 自动检测所有物体
+                self.statusBar().showMessage('正在进行语义分割...')
+                masks = self.predictor.predict_semantic_masks(
+                    frame_pil, 
+                    threshold=self.semantic_threshold
+                )
+            else:
+                # 提示分割模式 - 需要点或框
+                if point_coords is None and box is None:
+                    QMessageBox.warning(self, "警告", "请先添加点或框提示")
+                    self.statusBar().showMessage('请添加提示')
+                    return
+                
+                # 进行分割
+                masks = self.predictor.predict_masks(
+                    frame_pil,
+                    point_coords=point_coords,
+                    point_labels=point_labels,
+                    boxes=box.reshape(1, 4) if box is not None else None
+                )
+            
+            # 添加分割结果
+            self.video_canvas.add_segmentation_result(self.video_canvas.frame_index, masks)
+            self.statusBar().showMessage('分割完成')
+            
+        except Exception as e:
+            logger.error(f"Error in add_segmentation: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "错误", f"分割过程中出错: {str(e)}")
+            self.statusBar().showMessage('分割失败')
+    
+    def track_objects(self):
+        """追踪对象"""
+        if self.predictor is None:
+            QMessageBox.warning(self, "警告", "请先加载模型")
+            return
+        
+        if self.video_canvas.current_frame is None:
+            QMessageBox.warning(self, "警告", "请先加载视频")
+            return
+        
+        try:
+            # 检查当前帧是否有分割结果
+            if self.video_canvas.frame_index not in self.video_canvas.segmentation_results:
+                reply = QMessageBox.question(
+                    self, 
+                    "提示", 
+                    "当前帧没有分割结果，是否先进行分割？",
+                    QMessageBox.Yes | QMessageBox.No, 
+                    QMessageBox.Yes
+                )
+                
+                if reply == QMessageBox.Yes:
+                    self.add_segmentation()
+                else:
+                    return
+            
+            # 如果正在追踪，则停止追踪
+            if self.is_tracking:
+                self.statusBar().showMessage('停止追踪')
+                self.is_tracking = False
+                return
+            
+            # 显示进度对话框
+            progress = QProgressDialog("正在追踪对象...", "取消", 0, self.video_canvas.total_frames - self.video_canvas.frame_index, self)
+            progress.setWindowTitle("追踪进度")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setValue(0)
+            
+            self.statusBar().showMessage('开始追踪...')
+            
+            # 获取当前帧的掩码
+            init_masks = self.video_canvas.segmentation_results[self.video_canvas.frame_index]
+            
+            # 获取当前帧的PIL图像
+            init_frame = cv2_to_pil(self.video_canvas.current_frame)
+            
+            # 开始追踪
+            for frame_idx in range(self.video_canvas.frame_index + 1, self.video_canvas.total_frames):
+                # 检查是否取消
+                if progress.wasCanceled():
+                    break
+                
+                # 更新进度
+                progress.setValue(frame_idx - self.video_canvas.frame_index)
+                
+                # 获取下一帧
+                self.video_canvas.set_frame(frame_idx)
+                next_frame = cv2_to_pil(self.video_canvas.current_frame)
+                
+                # 追踪对象
+                tracked_masks = self.predictor.track_masks(next_frame, init_masks, init_frame)
+                
+                # 添加分割结果
+                self.video_canvas.add_segmentation_result(frame_idx, tracked_masks)
+                
+                # 更新进度
+                QApplication.processEvents()
+            
+            # 完成追踪
+            progress.setValue(self.video_canvas.total_frames - self.video_canvas.frame_index)
+            self.statusBar().showMessage('追踪完成')
+            
+        except Exception as e:
+            logger.error(f"Error in track_objects: {str(e)}", exc_info=True)
+            QMessageBox.critical(self, "错误", f"追踪过程中出错: {str(e)}")
+            self.statusBar().showMessage('追踪失败')
 
 
 if __name__ == "__main__":
